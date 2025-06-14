@@ -1,0 +1,5 @@
+numpy>=1.21.0
+tensorflow>=2.8.0
+pretty_midi>=0.2.9
+requests>=2.25.1
+flwr>=1.0.0
