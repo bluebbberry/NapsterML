@@ -154,6 +154,8 @@ class P2PMusicNetwork:
             def do_GET(self):
                 if self.path == "/peer_info":
                     self.send_peer_info()
+                elif self.path == "/peer_list":
+                    self.send_peer_list()
                 elif self.path.startswith("/models"):
                     self.send_models_list()
                 elif self.path.startswith("/groups"):
@@ -170,6 +172,10 @@ class P2PMusicNetwork:
                     self.handle_create_group()
                 elif self.path == "/share_model":
                     self.handle_share_model()
+                elif self.path == "/group_announce":
+                    self.handle_group_announce()
+                elif self.path == "/group_notification":
+                    self.handle_group_notification()
                 else:
                     self.send_error(404)
 
@@ -187,6 +193,117 @@ class P2PMusicNetwork:
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps(peer_info).encode())
+
+            def send_peer_list(self):
+                """Send list of known peers"""
+                peers_data = []
+                for peer in self.p2p_network.peers.values():
+                    peers_data.append({
+                        "peer_id": peer.peer_id,
+                        "username": peer.username,
+                        "ip_address": peer.ip_address,
+                        "port": peer.port,
+                        "genres": peer.genres,
+                        "reputation": peer.reputation_score
+                    })
+
+                response_data = {"peers": peers_data}
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(response_data).encode())
+
+            def send_models_list(self):
+                """Send list of available models"""
+                models_data = []
+                for model in self.p2p_network.models.values():
+                    models_data.append(asdict(model))
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(models_data).encode())
+
+            def send_groups_list(self):
+                """Send list of available groups"""
+                groups_data = []
+                for group in self.p2p_network.groups.values():
+                    if group.is_public:
+                        groups_data.append(asdict(group))
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(groups_data).encode())
+
+            def handle_group_announce(self):
+                """Handle group announcement from another peer"""
+                try:
+                    content_length = int(self.headers['Content-Length'])
+                    post_data = self.rfile.read(content_length)
+                    group_data = json.loads(post_data.decode('utf-8'))
+
+                    # Add the group to our known groups
+                    group = LearningGroup(
+                        group_id=group_data["group_id"],
+                        name=group_data["name"],
+                        genre=group_data["genre"],
+                        description=group_data["description"],
+                        admin=group_data["admin"],
+                        members=[group_data["admin"]],
+                        max_members=group_data["max_members"],
+                        is_public=group_data["is_public"],
+                        training_rounds=0,
+                        model_version="1.0.0",
+                        created_at=group_data["created_at"],
+                        last_active=group_data["timestamp"],
+                        entry_requirements={}
+                    )
+
+                    self.p2p_network.groups[group.group_id] = group
+
+                    self.send_response(200)
+                    self.end_headers()
+
+                except Exception as e:
+                    logger.error(f"Failed to handle group announcement: {e}")
+                    self.send_error(500)
+
+            def handle_group_notification(self):
+                """Handle group join notifications"""
+                try:
+                    content_length = int(self.headers['Content-Length'])
+                    post_data = self.rfile.read(content_length)
+                    notification = json.loads(post_data.decode('utf-8'))
+
+                    logger.info(f"👥 {notification['username']} joined group {notification['group_id'][:8]}...")
+
+                    self.send_response(200)
+                    self.end_headers()
+
+                except Exception as e:
+                    logger.error(f"Failed to handle group notification: {e}")
+                    self.send_error(500)
+
+            def handle_download(self):
+                """Handle model download requests"""
+                # Placeholder implementation
+                self.send_error(501, "Download not implemented yet")
+
+            def handle_join_group(self):
+                """Handle group join requests"""
+                # Placeholder implementation
+                self.send_error(501, "Join group not implemented yet")
+
+            def handle_create_group(self):
+                """Handle group creation requests"""
+                # Placeholder implementation
+                self.send_error(501, "Create group not implemented yet")
+
+            def handle_share_model(self):
+                """Handle model sharing requests"""
+                # Placeholder implementation
+                self.send_error(501, "Share model not implemented yet")
 
         # Create server with closure to pass p2p_network
         handler = lambda *args, **kwargs: P2PHandler(self, *args, **kwargs)
@@ -555,6 +672,121 @@ class P2PMusicNetwork:
         """Shutdown the network"""
         self.running = False
         logger.info("🛑 Shutting down P2P Music Network")
+
+    def announce_group(self, group: LearningGroup):
+        """Announce a new group to the network"""
+        try:
+            group_announcement = {
+                "type": "group_announce",
+                "group_id": group.group_id,
+                "name": group.name,
+                "genre": group.genre,
+                "description": group.description,
+                "admin": group.admin,
+                "max_members": group.max_members,
+                "is_public": group.is_public,
+                "created_at": group.created_at,
+                "peer_id": self.peer_id,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Announce to all known peers
+            for peer in self.peers.values():
+                try:
+                    requests.post(
+                        f"http://{peer.ip_address}:{peer.port}/group_announce",
+                        json=group_announcement,
+                        timeout=5
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to announce group to {peer.username}: {e}")
+
+        except Exception as e:
+            logger.error(f"Group announcement failed: {e}")
+
+    def request_peer_lists(self):
+        """Request peer lists from known peers to discover more peers"""
+        for peer in list(self.peers.values()):
+            try:
+                response = requests.get(
+                    f"http://{peer.ip_address}:{peer.port}/peer_list",
+                    timeout=5
+                )
+                if response.status_code == 200:
+                    peer_list = response.json()
+                    for peer_data in peer_list.get("peers", []):
+                        # Add new peers we don't know about
+                        if peer_data["peer_id"] not in self.peers and peer_data["peer_id"] != self.peer_id:
+                            self.add_peer(peer_data, peer_data["ip_address"], peer_data["port"])
+            except Exception as e:
+                logger.debug(f"Failed to get peer list from {peer.username}: {e}")
+
+    def meets_requirements(self, requirements: Dict) -> bool:
+        """Check if this peer meets the group entry requirements"""
+        # Simple implementation - can be extended
+        if not requirements:
+            return True
+
+        # Check minimum reputation if required
+        min_reputation = requirements.get("min_reputation", 0)
+        if self.reputation_score < min_reputation:
+            return False
+
+        # Check required genres if specified
+        required_genres = requirements.get("required_genres", [])
+        if required_genres:
+            my_genres = list(set([model.genre for model in self.models.values()]))
+            if not any(genre in my_genres for genre in required_genres):
+                return False
+
+        return True
+
+    def notify_group_join(self, group_id: str):
+        """Notify group admin about a new member joining"""
+        if group_id not in self.groups:
+            return
+
+        group = self.groups[group_id]
+        admin_peer = self.peers.get(group.admin)
+
+        if admin_peer:
+            try:
+                notification = {
+                    "type": "group_join",
+                    "group_id": group_id,
+                    "new_member": self.peer_id,
+                    "username": self.username,
+                    "timestamp": datetime.now().isoformat()
+                }
+
+                requests.post(
+                    f"http://{admin_peer.ip_address}:{admin_peer.port}/group_notification",
+                    json=notification,
+                    timeout=5
+                )
+            except Exception as e:
+                logger.debug(f"Failed to notify group admin: {e}")
+
+    def start_group_training_server(self, group_id: str, rounds: int):
+        """Start federated training as server (group admin)"""
+        logger.info(f"🚀 Starting federated training server for group {group_id}")
+        # Placeholder for federated learning server implementation
+        # This would use the flwr framework to coordinate training
+        pass
+
+    def start_group_training_client(self, group_id: str):
+        """Join federated training as client"""
+        logger.info(f"🤝 Joining federated training for group {group_id}")
+        # Placeholder for federated learning client implementation
+        # This would use the flwr framework to participate in training
+        pass
+
+    def load_model_from_file(self, model_path: str):
+        """Load a model from file"""
+        # Simple implementation - returns a basic generator
+        generator = SimpleMIDIGenerator()
+        generator.build_model()
+        return generator
 
 
 # Simplified MIDI generator for the prototype
