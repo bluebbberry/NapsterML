@@ -113,6 +113,45 @@ class P2PMusicNetwork:
 
         logger.info(f"Initialized P2P Music Network - Peer ID: {self.peer_id[:8]}...")
 
+    def start_multicast_listener(self):
+        """Listen for multicast announcements from other peers"""
+
+        def listener():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(('', 9999))
+
+                while self.running:
+                    try:
+                        data, addr = sock.recvfrom(1024)
+                        announce_data = json.loads(data.decode())
+
+                        if (announce_data.get("type") == "peer_announce"
+                                and announce_data.get("peer_id") != self.peer_id):
+                            # Discovered a new peer via multicast
+                            peer_info = {
+                                "peer_id": announce_data["peer_id"],
+                                "username": announce_data["username"],
+                                "genres": [],
+                                "reputation": 5.0
+                            }
+
+                            self.add_peer(peer_info, announce_data["ip"], announce_data["port"])
+
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        logger.debug(f"Multicast listener error: {e}")
+
+            except Exception as e:
+                logger.error(f"Failed to start multicast listener: {e}")
+
+        # Start listener in background thread
+        listener_thread = threading.Thread(target=listener)
+        listener_thread.daemon = True
+        listener_thread.start()
+
     def get_local_ip(self):
         """Get local IP address"""
         try:
@@ -132,6 +171,9 @@ class P2PMusicNetwork:
         self.server_thread = threading.Thread(target=self.start_http_server)
         self.server_thread.daemon = True
         self.server_thread.start()
+
+        # Start multicast listener - THIS WAS MISSING!
+        self.start_multicast_listener()
 
         # Start peer discovery
         self.discovery_thread = threading.Thread(target=self.peer_discovery_loop)
@@ -316,11 +358,20 @@ class P2PMusicNetwork:
 
     def peer_discovery_loop(self):
         """Discover peers in the network"""
+        # Initial rapid discovery
+        for i in range(3):
+            try:
+                self.discover_peers()
+                time.sleep(2)  # Quick initial scans
+            except Exception as e:
+                logger.error(f"Initial peer discovery error: {e}")
+
+        # Then normal discovery loop
         while self.running:
             try:
                 self.discover_peers()
                 self.cleanup_inactive_peers()
-                time.sleep(30)  # Discovery every 30 seconds
+                time.sleep(15)  # Reduced from 30 seconds
             except Exception as e:
                 logger.error(f"Peer discovery error: {e}")
 
@@ -338,6 +389,7 @@ class P2PMusicNetwork:
     def multicast_announce(self):
         """Announce presence via multicast"""
         try:
+            # Try both broadcast and multicast
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
@@ -350,8 +402,17 @@ class P2PMusicNetwork:
                 "timestamp": datetime.now().isoformat()
             }
 
-            sock.sendto(json.dumps(announce_data).encode(), ('255.255.255.255', 9999))
+            message = json.dumps(announce_data).encode()
+
+            # Broadcast
+            sock.sendto(message, ('255.255.255.255', 9999))
+
+            # Also try localhost for same-machine testing
+            sock.sendto(message, ('127.0.0.1', 9999))
+
             sock.close()
+            logger.debug(f"Sent multicast announcement")
+
         except Exception as e:
             logger.debug(f"Multicast announce failed: {e}")
 
@@ -359,24 +420,41 @@ class P2PMusicNetwork:
         """Scan local network for peers"""
         base_ip = ".".join(self.ip_address.split(".")[:-1])
 
-        def check_peer(ip):
+        def check_peer(ip, port):
             try:
-                response = requests.get(f"http://{ip}:{self.port}/peer_info", timeout=2)
-                if response.status_code == 200:
-                    peer_data = response.json()
-                    self.add_peer(peer_data, ip, self.port)
+                # Try multiple common ports, not just self.port
+                for p in [8000, 8001, 8002, 8003, 8004, 8005]:
+                    try:
+                        response = requests.get(f"http://{ip}:{p}/peer_info", timeout=1)
+                        if response.status_code == 200:
+                            peer_data = response.json()
+                            self.add_peer(peer_data, ip, p)
+                            return
+                    except:
+                        continue
             except:
                 pass
 
-        # Check common ports and IPs in parallel
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            for i in range(1, 255):
-                ip = f"{base_ip}.{i}"
-                if ip != self.ip_address:
-                    executor.submit(check_peer, ip)
+        # Scan local network range
+        with ThreadPoolExecutor(max_workers=50) as executor:
+            # Scan localhost first (for testing on same machine)
+            for port in range(8000, 8010):
+                if port != self.port:
+                    executor.submit(check_peer, "127.0.0.1", port)
+
+            # Then scan local network
+            if not self.ip_address.startswith("127."):
+                for i in range(1, 255):
+                    ip = f"{base_ip}.{i}"
+                    if ip != self.ip_address:
+                        executor.submit(check_peer, ip, None)
 
     def add_peer(self, peer_data: dict, ip: str, port: int):
         """Add a discovered peer"""
+        # Don't add ourselves
+        if peer_data["peer_id"] == self.peer_id:
+            return
+
         peer_info = PeerInfo(
             peer_id=peer_data["peer_id"],
             username=peer_data["username"],
@@ -391,8 +469,13 @@ class P2PMusicNetwork:
             download_count=0
         )
 
-        self.peers[peer_info.peer_id] = peer_info
-        logger.info(f"📡 Discovered peer: {peer_info.username} ({peer_info.peer_id[:8]}...)")
+        if peer_info.peer_id not in self.peers:
+            self.peers[peer_info.peer_id] = peer_info
+            logger.info(f"📡 NEW PEER: {peer_info.username} @ {ip}:{port} ({peer_info.peer_id[:8]}...)")
+        else:
+            # Update existing peer
+            self.peers[peer_info.peer_id] = peer_info
+            logger.debug(f"📡 Updated peer: {peer_info.username}")
 
     def create_learning_group(self, name: str, genre: str, description: str,
                               max_members: int = 10, is_public: bool = True,
