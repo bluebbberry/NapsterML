@@ -1,3 +1,8 @@
+*.mid
+midi_model.h5
+midi_generator.pkl
+best_music_model.h5
+
 # Created by https://www.toptal.com/developers/gitignore/api/intellij,python
 # Edit at https://www.toptal.com/developers/gitignore?templates=intellij,python
 
