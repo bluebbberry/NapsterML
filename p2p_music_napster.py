@@ -715,7 +715,7 @@ class P2PMusicNetwork:
     def display_network_browser(self):
         """Display network browser interface"""
         print("\n" + "=" * 80)
-        print("🎵 P2P MUSIC AI NETWORK BROWSER")
+        print("🎵 NAPSTER_ML - P2P MUSIC AI NETWORK BROWSER")
         print("=" * 80)
 
         stats = self.get_network_stats()
@@ -754,7 +754,7 @@ class P2PMusicNetwork:
     def shutdown(self):
         """Shutdown the network"""
         self.running = False
-        logger.info("🛑 Shutting down P2P Music Network")
+        logger.info("🛑 Shutting down NapsterML - P2P Music Network")
 
     def announce_group(self, group: LearningGroup):
         """Announce a new group to the network"""
@@ -923,7 +923,7 @@ class SimpleMIDIGenerator:
 
 def main():
     """Main function"""
-    parser = argparse.ArgumentParser(description="P2P Music AI Network - Napster for Song ML Models")
+    parser = argparse.ArgumentParser(description="Napster ML - P2P Music AI Network. Napster for Song ML Models")
     parser.add_argument("--username", type=str, required=True, help="Your username")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
     parser.add_argument("--mode", choices=["interactive", "daemon"], default="interactive")
