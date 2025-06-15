@@ -24,6 +24,9 @@ import zipfile
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 import flwr as fl
+from flwr.client import NumPyClient
+from flwr.server import start_server
+from flwr.server.strategy import FedAvg
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -851,18 +854,31 @@ class P2PMusicNetwork:
                 logger.debug(f"Failed to notify group admin: {e}")
 
     def start_group_training_server(self, group_id: str, rounds: int):
-        """Start federated training as server (group admin)"""
-        logger.info(f"🚀 Starting federated training server for group {group_id}")
-        # Placeholder for federated learning server implementation
-        # This would use the flwr framework to coordinate training
-        pass
+        """Start federated learning server"""
+        logger.info(f"🚀 Starting FL server for group {group_id}")
+        strategy = FedAvg(min_fit_clients=2, min_evaluate_clients=2, min_available_clients=2)
+        start_server(server_address=f"0.0.0.0:{self.port + 1000}", config=fl.server.ServerConfig(num_rounds=rounds), strategy=strategy)
 
     def start_group_training_client(self, group_id: str):
-        """Join federated training as client"""
-        logger.info(f"🤝 Joining federated training for group {group_id}")
-        # Placeholder for federated learning client implementation
-        # This would use the flwr framework to participate in training
-        pass
+        """Join federated learning as client"""
+        logger.info(f"🤝 Joining FL training for group {group_id}")
+
+        # Create simple training data (in real app, use actual MIDI data)
+        X_train = np.random.random((100, 64, 16))
+        y_train = np.random.random((100, 64, 16))
+        X_val = np.random.random((20, 64, 16))
+        y_val = np.random.random((20, 64, 16))
+
+        # Create model
+        model = SimpleMIDIGenerator().build_model()
+
+        # Find group admin's server address
+        group = self.groups[group_id]
+        admin_peer = self.peers.get(group.admin)
+        if admin_peer:
+            server_address = f"{admin_peer.ip_address}:{admin_peer.port + 1000}"
+            client = MusicFLClient(model, (X_train, y_train), (X_val, y_val))
+            fl.client.start_numpy_client(server_address=server_address, client=client)
 
     def load_model_from_file(self, model_path: str):
         """Load a model from file"""
@@ -920,6 +936,25 @@ class SimpleMIDIGenerator:
         pm.write(filename)
         return filename
 
+class MusicFLClient(NumPyClient):
+    def __init__(self, model, train_data, val_data):
+        self.model = model
+        self.train_data = train_data
+        self.val_data = val_data
+
+    def get_parameters(self, config):
+        return self.model.get_weights()
+
+    def fit(self, parameters, config):
+        self.model.set_weights(parameters)
+        self.model.fit(self.train_data[0], self.train_data[1], epochs=1, batch_size=32, verbose=0)
+        return self.model.get_weights(), len(self.train_data[0]), {}
+
+    def evaluate(self, parameters, config):
+        self.model.set_weights(parameters)
+        loss, accuracy = self.model.evaluate(self.val_data[0], self.val_data[1], verbose=0)
+        return loss, len(self.val_data[0]), {"accuracy": accuracy}
+
 
 def main():
     """Main function"""
@@ -942,15 +977,16 @@ def main():
 
         while True:
             try:
-                print("\n📋 MENU:")
+                print("📋 MENU:")
                 print("1. Browse Network")
                 print("2. Search Models")
                 print("3. Create Learning Group")
                 print("4. Join Learning Group")
                 print("5. Discover Groups")
                 print("6. Generate Song")
-                print("7. Network Stats")
-                print("8. Exit")
+                print("7. Start Federated Training")  # NEW
+                print("8. Network Stats")
+                print("9. Exit")
 
                 choice = input("\nEnter choice (1-8): ").strip()
 
@@ -1021,9 +1057,31 @@ def main():
                     print(f"✅ Generated: {filename}")
 
                 elif choice == "7":
-                    network.display_network_browser()
+                    if network.my_groups:
+                        print("\n🎯 Your Groups:")
+                        groups_list = list(network.my_groups)
+                        for i, group_id in enumerate(groups_list, 1):
+                            group = network.groups[group_id]
+                            print(f"  {i}. {group.name} ({group.genre}) - {len(group.members)} members")
+
+                        try:
+                            selection = int(input("Select group for training (0 to cancel): "))
+                            if 1 <= selection <= len(groups_list):
+                                selected_group_id = groups_list[selection - 1]
+                                rounds = int(input("Training rounds (default 5): ") or "5")
+                                print(f"🚀 Starting federated training...")
+                                network.start_federated_training(selected_group_id, rounds)
+                            else:
+                                print("Cancelled")
+                        except ValueError:
+                            print("Invalid selection")
+                    else:
+                        print("❌ You need to join a group first!")
 
                 elif choice == "8":
+                    network.display_network_browser()
+
+                elif choice == "9":
                     break
 
                 else:
