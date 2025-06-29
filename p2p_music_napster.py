@@ -1,1132 +1,717 @@
-import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
-from tensorflow.keras.optimizers import Adam
-import pretty_midi
-import glob
-import os
-import pickle
-import random
+# P2P Music Generation Network MVP
+# A distributed system for collaborative music model training and generation
+
+import asyncio
 import json
 import hashlib
 import time
-import threading
-import socket
-import requests
-import argparse
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional, Set
-import logging
+import random
+import os
+import pickle
+from typing import Dict, List, Set, Optional, Tuple
 from dataclasses import dataclass, asdict
-import uuid
-import zipfile
-import tempfile
-from concurrent.futures import ThreadPoolExecutor
-import flwr as fl
-from flwr.client import NumPyClient
-from flwr.server import start_server
-from flwr.server.strategy import FedAvg
+from enum import Enum
+import socket
+import threading
+from collections import defaultdict
+import numpy as np
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+
+# Mock implementations for external dependencies
+class MockFlowerClient:
+    """Mock Flower FL client with basic training logic"""
+
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.model_weights = np.random.random((100, 50))  # Mock model weights
+        self.learning_rate = 0.01
+
+    def get_parameters(self):
+        return self.model_weights.flatten()
+
+    def set_parameters(self, parameters):
+        self.model_weights = np.array(parameters).reshape((100, 50))
+
+    def fit(self, training_data):
+        # Basic training simulation: adjust weights based on music features
+        if not training_data:
+            return 0, {"loss": 1.0}
+
+        # Extract features from training data and do simple gradient descent
+        total_loss = 0
+        for data in training_data:
+            features = data.get('features', {})
+            # Convert music features to numerical values
+            tempo = features.get('tempo', 120) / 200.0  # Normalize tempo
+            energy = features.get('energy', 0.5)
+            key_map = {'C': 0, 'D': 0.14, 'E': 0.28, 'F': 0.42, 'G': 0.57, 'A': 0.71, 'B': 0.85}
+            key_val = key_map.get(features.get('key', 'C'), 0)
+
+            # Create target vector from features
+            target = np.array([tempo, energy, key_val] * 17)[:50]  # Pad to 50 features
+
+            # Simple loss calculation and weight update
+            for i in range(self.model_weights.shape[0]):
+                prediction = np.dot(self.model_weights[i], target)
+                loss = (prediction - tempo) ** 2  # Simple MSE loss
+                total_loss += loss
+
+                # Gradient descent update
+                gradient = 2 * (prediction - tempo) * target
+                self.model_weights[i] -= self.learning_rate * gradient
+
+        avg_loss = total_loss / (len(training_data) * self.model_weights.shape[0])
+        return len(training_data), {"loss": float(avg_loss)}
+
+    def evaluate(self, test_data):
+        return len(test_data), {"accuracy": random.uniform(0.7, 0.9)}
+
+
+class MockMusicGenerator:
+    """Mock music generation model that learns from training"""
+
+    def __init__(self, weights=None):
+        self.weights = weights or np.random.random((100, 50))
+        self.learned_genres = []
+        self.learned_patterns = {}
+
+    def update_from_training(self, training_results: List[Dict]):
+        """Update generator based on aggregated training results"""
+        # Extract genre patterns from training
+        genre_counts = defaultdict(int)
+        tempo_ranges = defaultdict(list)
+
+        for result in training_results:
+            if 'genres' in result:
+                for genre in result['genres']:
+                    genre_counts[genre] += 1
+            if 'tempo_patterns' in result:
+                for genre, tempos in result['tempo_patterns'].items():
+                    tempo_ranges[genre].extend(tempos)
+
+        self.learned_genres = list(genre_counts.keys())
+        self.learned_patterns = {
+            'genres': dict(genre_counts),
+            'tempo_ranges': {k: (min(v), max(v)) if v else (120, 140)
+                             for k, v in tempo_ranges.items()}
+        }
+
+    def generate_song(self, style_params: Dict) -> Dict:
+        """Generate a song using learned patterns"""
+        # Use learned patterns if available
+        if self.learned_genres and random.random() > 0.3:
+            genre = random.choice(self.learned_genres)
+        else:
+            genre = style_params.get('genre', random.choice(["pop", "rock", "jazz", "electronic"]))
+
+        # Use learned tempo patterns
+        if genre in self.learned_patterns.get('tempo_ranges', {}):
+            tempo_min, tempo_max = self.learned_patterns['tempo_ranges'][genre]
+            tempo = random.randint(int(tempo_min), int(tempo_max))
+        else:
+            tempo = style_params.get('tempo', random.randint(60, 180))
+
+        # Generate song with learned characteristics
+        song_features = np.mean(self.weights, axis=0)
+        complexity = np.std(song_features)
+
+        return {
+            "title": f"AI Generated - {genre.title()} #{random.randint(1000, 9999)}",
+            "duration": random.randint(120, 300),
+            "genre": genre,
+            "features": {
+                "tempo": tempo,
+                "key": random.choice(["C", "D", "E", "F", "G", "A", "B"]),
+                "mood": random.choice(["happy", "sad", "energetic", "calm"]),
+                "complexity": float(complexity),
+                "energy": min(1.0, float(np.max(song_features)))
+            },
+            "audio_data": f"generated_audio_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}",
+            "model_signature": hashlib.md5(self.weights.tobytes()).hexdigest()[:16]
+        }
+
+
+class NodeType(Enum):
+    PEER = "peer"
+    COORDINATOR = "coordinator"
 
 
 @dataclass
-class MusicModel:
-    """Represents a music generation model"""
-    model_id: str
-    name: str
+class Song:
+    title: str
+    artist: str
+    duration: int
     genre: str
-    description: str
-    creator: str
-    version: str
-    quality_score: float
-    download_count: int
-    file_size: int
-    created_at: str
-    last_updated: str
-    tags: List[str]
-    sample_songs: List[str]  # URLs to sample songs
-    model_hash: str
+    audio_features: Dict
+    file_hash: str
+
+    def to_training_data(self):
+        """Convert song to training data format"""
+        return {
+            "features": self.audio_features,
+            "metadata": {
+                "genre": self.genre,
+                "duration": self.duration
+            }
+        }
 
 
 @dataclass
-class LearningGroup:
-    """Represents a collaborative learning group"""
-    group_id: str
-    name: str
-    genre: str
-    description: str
-    admin: str
-    members: List[str]
-    max_members: int
-    is_public: bool
-    training_rounds: int
-    model_version: str
-    created_at: str
-    last_active: str
-    entry_requirements: Dict[str, any]  # e.g., minimum data quality, genre match
-
-
-@dataclass
-class PeerInfo:
-    """Information about a peer in the network"""
-    peer_id: str
-    username: str
+class Node:
+    node_id: str
     ip_address: str
     port: int
-    last_seen: str
-    genres: List[str]
-    models_shared: List[str]
-    groups_joined: List[str]
-    reputation_score: float
-    upload_count: int
-    download_count: int
+    node_type: NodeType
+    last_seen: float
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class TrainingSession:
+    session_id: str
+    coordinator_id: str
+    participants: Set[str]
+    status: str
+    created_at: float
+    model_version: int
+
+
+class LocalStorage:
+    """Handles local file storage for generated songs and models"""
+
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.base_dir = f"p2p_music_node_{node_id}"
+        self.songs_dir = os.path.join(self.base_dir, "generated_songs")
+        self.models_dir = os.path.join(self.base_dir, "models")
+        self._ensure_directories()
+
+    def _ensure_directories(self):
+        """Create necessary directories"""
+        os.makedirs(self.songs_dir, exist_ok=True)
+        os.makedirs(self.models_dir, exist_ok=True)
+
+    def save_song(self, song: Dict) -> str:
+        """Save a generated song locally"""
+        filename = f"{song['title'].replace(' ', '_')}_{int(time.time())}.json"
+        filepath = os.path.join(self.songs_dir, filename)
+
+        # Add local metadata
+        song_data = song.copy()
+        song_data['saved_at'] = time.time()
+        song_data['local_path'] = filepath
+
+        with open(filepath, 'w') as f:
+            json.dump(song_data, f, indent=2)
+
+        print(f"Saved song: {song['title']} -> {filepath}")
+        return filepath
+
+    def save_model(self, model_weights: np.ndarray, version: int) -> str:
+        """Save model weights locally"""
+        filename = f"model_v{version}_{int(time.time())}.pkl"
+        filepath = os.path.join(self.models_dir, filename)
+
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_weights, f)
+
+        print(f"Saved model version {version} -> {filepath}")
+        return filepath
+
+    def load_saved_songs(self) -> List[Dict]:
+        """Load all locally saved songs"""
+        songs = []
+        if os.path.exists(self.songs_dir):
+            for filename in os.listdir(self.songs_dir):
+                if filename.endswith('.json'):
+                    filepath = os.path.join(self.songs_dir, filename)
+                    try:
+                        with open(filepath, 'r') as f:
+                            song = json.load(f)
+                            songs.append(song)
+                    except Exception as e:
+                        print(f"Error loading song {filename}: {e}")
+        return songs
+
+    def get_storage_stats(self) -> Dict:
+        """Get local storage statistics"""
+        song_count = len([f for f in os.listdir(self.songs_dir) if f.endswith('.json')]) if os.path.exists(
+            self.songs_dir) else 0
+        model_count = len([f for f in os.listdir(self.models_dir) if f.endswith('.pkl')]) if os.path.exists(
+            self.models_dir) else 0
+
+        return {
+            'songs_stored': song_count,
+            'models_stored': model_count,
+            'storage_path': self.base_dir
+        }
+
+
+class P2PNetworkManager:
+    """Handles P2P node discovery and communication"""
+
+    def __init__(self, node_id: str, port: int):
+        self.node_id = node_id
+        self.port = port
+        self.known_nodes: Dict[str, Node] = {}
+        self.is_running = False
+        self.discovery_socket = None
+
+    async def start_discovery(self):
+        """Start P2P node discovery using UDP broadcast"""
+        self.is_running = True
+        self.discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.discovery_socket.bind(('', self.port))
+
+        # Start discovery threads
+        threading.Thread(target=self._discovery_listener, daemon=True).start()
+        threading.Thread(target=self._discovery_broadcaster, daemon=True).start()
+
+    def _discovery_listener(self):
+        """Listen for discovery messages from other nodes"""
+        while self.is_running:
+            try:
+                data, addr = self.discovery_socket.recvfrom(1024)
+                message = json.loads(data.decode())
+
+                if message['type'] == 'discovery' and message['node_id'] != self.node_id:
+                    node = Node(
+                        node_id=message['node_id'],
+                        ip_address=addr[0],
+                        port=message['port'],
+                        node_type=NodeType(message['node_type']),
+                        last_seen=time.time()
+                    )
+                    self.known_nodes[node.node_id] = node
+                    print(f"Discovered node: {node.node_id} ({node.node_type.value})")
+
+            except Exception as e:
+                print(f"Error in discovery listener: {e}")
+
+    def _discovery_broadcaster(self):
+        """Broadcast discovery messages to find other nodes"""
+        while self.is_running:
+            try:
+                message = {
+                    'type': 'discovery',
+                    'node_id': self.node_id,
+                    'port': self.port,
+                    'node_type': 'peer',
+                    'timestamp': time.time()
+                }
+
+                self.discovery_socket.sendto(
+                    json.dumps(message).encode(),
+                    ('<broadcast>', self.port)
+                )
+                time.sleep(30)  # Broadcast every 30 seconds
+
+            except Exception as e:
+                print(f"Error in discovery broadcaster: {e}")
+
+    def get_coordinators(self) -> List[Node]:
+        """Get list of known coordinator nodes"""
+        return [node for node in self.known_nodes.values()
+                if node.node_type == NodeType.COORDINATOR]
+
+    def get_peers(self) -> List[Node]:
+        """Get list of known peer nodes"""
+        return [node for node in self.known_nodes.values()
+                if node.node_type == NodeType.PEER]
+
+
+class MusicLibrary:
+    """Manages local music collection and training data"""
+
+    def __init__(self):
+        self.songs: Dict[str, Song] = {}
+        self.training_data: List[Dict] = []
+
+    def add_song(self, song: Song):
+        """Add a song to the library"""
+        self.songs[song.file_hash] = song
+        training_sample = song.to_training_data()
+        self.training_data.append(training_sample)
+        print(f"Added song: {song.title} by {song.artist}")
+
+    def get_training_data(self) -> List[Dict]:
+        """Get training data for federated learning"""
+        return self.training_data
+
+    def get_training_summary(self) -> Dict:
+        """Get summary of training data for model learning"""
+        if not self.training_data:
+            return {}
+
+        genres = [data['metadata']['genre'] for data in self.training_data]
+        tempos = []
+        for data in self.training_data:
+            if 'tempo' in data['features']:
+                tempos.append(data['features']['tempo'])
+
+        tempo_by_genre = defaultdict(list)
+        for data in self.training_data:
+            genre = data['metadata']['genre']
+            if 'tempo' in data['features']:
+                tempo_by_genre[genre].append(data['features']['tempo'])
+
+        return {
+            'genres': list(set(genres)),
+            'tempo_patterns': dict(tempo_by_genre),
+            'total_songs': len(self.training_data)
+        }
+
+    def get_song_count(self) -> int:
+        """Get total number of songs in library"""
+        return len(self.songs)
+
+
+class DistributedTrainingManager:
+    """Manages distributed training using Flower AI"""
+
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.fl_client = MockFlowerClient(node_id)
+        self.current_session: Optional[TrainingSession] = None
+
+    async def join_training_session(self, session: TrainingSession, training_data: List[Dict]):
+        """Join a federated learning training session"""
+        print(f"Joining training session {session.session_id}")
+
+        # Simulate federated learning round with actual training
+        self.current_session = session
+
+        # Fit model on local data (now with real training logic)
+        loss, metrics = self.fl_client.fit(training_data)
+        print(f"Local training completed. Data points: {loss}, Loss: {metrics.get('loss', 'N/A'):.4f}")
+
+        # Get updated model parameters
+        parameters = self.fl_client.get_parameters()
+
+        return {
+            'node_id': self.node_id,
+            'parameters': parameters.tolist(),
+            'data_size': len(training_data),
+            'metrics': metrics
+        }
+
+    def get_model_weights(self):
+        """Get current model weights"""
+        return self.fl_client.get_parameters()
+
+
+class CoordinatorNode:
+    """Central coordination node for training orchestration and song generation"""
+
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.node_type = NodeType.COORDINATOR
+        self.active_sessions: Dict[str, TrainingSession] = {}
+        self.global_model = MockMusicGenerator()
+        self.generated_songs: List[Dict] = []
+        self.local_storage = LocalStorage(node_id)
+
+    async def orchestrate_training(self, participants: List[str]) -> str:
+        """Orchestrate a federated learning training session"""
+        session_id = hashlib.md5(f"{time.time()}{self.node_id}".encode()).hexdigest()[:12]
+
+        session = TrainingSession(
+            session_id=session_id,
+            coordinator_id=self.node_id,
+            participants=set(participants),
+            status="active",
+            created_at=time.time(),
+            model_version=len(self.active_sessions)
+        )
+
+        self.active_sessions[session_id] = session
+        print(f"Started training session {session_id} with {len(participants)} participants")
+
+        return session_id
+
+    def aggregate_model_updates(self, session_id: str, updates: List[Dict]) -> Dict:
+        """Aggregate model updates from participants using federated averaging"""
+        if session_id not in self.active_sessions:
+            return {"error": "Session not found"}
+
+        # Simple federated averaging
+        total_data_size = sum(update['data_size'] for update in updates)
+
+        if total_data_size == 0:
+            return {"error": "No training data"}
+
+        # Weighted average of parameters
+        aggregated_params = np.zeros_like(np.array(updates[0]['parameters']))
+
+        for update in updates:
+            weight = update['data_size'] / total_data_size
+            aggregated_params += weight * np.array(update['parameters'])
+
+        # Update global model with aggregated parameters
+        self.global_model.weights = aggregated_params.reshape((100, 50))
+
+        # Collect training summaries from updates for model learning
+        training_summaries = []
+        for update in updates:
+            if 'training_summary' in update:
+                training_summaries.append(update['training_summary'])
+
+        # Update generator with learned patterns
+        if training_summaries:
+            self.global_model.update_from_training(training_summaries)
+
+        # Mark session as completed
+        self.active_sessions[session_id].status = "completed"
+
+        print(f"Model aggregation completed for session {session_id}")
+        avg_loss = np.mean([update['metrics'].get('loss', 0) for update in updates])
+        print(f"Average training loss: {avg_loss:.4f}")
+
+        return {
+            "session_id": session_id,
+            "model_version": self.active_sessions[session_id].model_version,
+            "participants": len(updates),
+            "avg_loss": float(avg_loss)
+        }
+
+    def generate_songs(self, count: int = 5, style_params: Dict = None) -> List[Dict]:
+        """Generate songs using the trained global model"""
+        if style_params is None:
+            style_params = {}
+
+        new_songs = []
+        for _ in range(count):
+            song = self.global_model.generate_song(style_params)
+            song['generated_by'] = self.node_id
+            song['model_version'] = len(self.active_sessions)
+            song['timestamp'] = time.time()
+            new_songs.append(song)
+
+        self.generated_songs.extend(new_songs)
+        print(f"Generated {count} new songs")
+        return new_songs
+
+
+class PeerNode:
+    """Peer node that participates in training and downloads generated music"""
+
+    def __init__(self, node_id: str, port: int):
+        self.node_id = node_id
+        self.node_type = NodeType.PEER
+        self.network_manager = P2PNetworkManager(node_id, port)
+        self.music_library = MusicLibrary()
+        self.training_manager = DistributedTrainingManager(node_id)
+        self.local_storage = LocalStorage(node_id)
+        self.downloaded_songs: List[Dict] = []
+
+    async def start(self):
+        """Start the peer node"""
+        print(f"Starting peer node {self.node_id}")
+        await self.network_manager.start_discovery()
+
+        # Add some mock songs to library
+        await self._add_sample_songs()
+
+        # Load previously saved songs
+        saved_songs = self.local_storage.load_saved_songs()
+        print(f"Loaded {len(saved_songs)} previously saved songs")
+
+    async def _add_sample_songs(self):
+        """Add sample songs for demonstration with realistic features"""
+        sample_data = [
+            {"title": "Upbeat Pop Track", "artist": "AI Artist A", "genre": "pop",
+             "tempo": 128, "key": "C", "energy": 0.8},
+            {"title": "Chill Electronic", "artist": "AI Artist B", "genre": "electronic",
+             "tempo": 100, "key": "Am", "energy": 0.6},
+            {"title": "Rock Anthem", "artist": "AI Artist C", "genre": "rock",
+             "tempo": 140, "key": "E", "energy": 0.9},
+        ]
+
+        for i, data in enumerate(sample_data):
+            song = Song(
+                title=data["title"],
+                artist=data["artist"],
+                duration=random.randint(180, 240),
+                genre=data["genre"],
+                audio_features={
+                    "tempo": data["tempo"],
+                    "key": data["key"],
+                    "energy": data["energy"]
+                },
+                file_hash=f"hash_{self.node_id}_{i}"
+            )
+            self.music_library.add_song(song)
+
+    async def participate_in_training(self):
+        """Find and participate in training sessions"""
+        coordinators = self.network_manager.get_coordinators()
+
+        if not coordinators:
+            print("No coordinators found for training")
+            return
+
+        # Join training with first available coordinator
+        coordinator = coordinators[0]
+        print(f"Attempting to join training with coordinator {coordinator.node_id}")
+
+        training_data = self.music_library.get_training_data()
+
+        if training_data:
+            # Create training session
+            mock_session = TrainingSession(
+                session_id="mock_session",
+                coordinator_id=coordinator.node_id,
+                participants={self.node_id},
+                status="active",
+                created_at=time.time(),
+                model_version=1
+            )
+
+            result = await self.training_manager.join_training_session(mock_session, training_data)
+
+            # Add training summary to result
+            result['training_summary'] = self.music_library.get_training_summary()
+
+            print(f"Training participation result: {result['data_size']} songs contributed")
+            return result
+
+    def download_generated_songs(self, songs: List[Dict]):
+        """Download and save generated songs locally"""
+        newly_downloaded = 0
+        for song in songs:
+            if song not in self.downloaded_songs:
+                self.downloaded_songs.append(song)
+                # Save song locally
+                self.local_storage.save_song(song)
+                newly_downloaded += 1
+                print(f"Downloaded & Saved: {song['title']} ({song['genre']})")
+
+        if newly_downloaded > 0:
+            stats = self.local_storage.get_storage_stats()
+            print(f"Total songs stored locally: {stats['songs_stored']}")
+
+    def get_local_library_stats(self) -> Dict:
+        """Get statistics about local music library and storage"""
+        storage_stats = self.local_storage.get_storage_stats()
+        library_stats = self.music_library.get_training_summary()
+
+        return {
+            **storage_stats,
+            **library_stats,
+            'downloaded_songs': len(self.downloaded_songs)
+        }
 
 
 class P2PMusicNetwork:
-    """Peer-to-peer network for music AI models"""
+    """Main application class that orchestrates the entire system"""
 
-    def __init__(self, username: str, port: int = 8000):
-        self.username = username
-        self.peer_id = str(uuid.uuid4())
-        self.port = port
-        self.ip_address = self.get_local_ip()
+    def __init__(self):
+        self.nodes: Dict[str, PeerNode] = {}
+        self.coordinators: Dict[str, CoordinatorNode] = {}
 
-        # Network state
-        self.peers: Dict[str, PeerInfo] = {}
-        self.models: Dict[str, MusicModel] = {}
-        self.groups: Dict[str, LearningGroup] = {}
-        self.my_groups: Set[str] = set()
+    def create_peer_node(self, node_id: str, port: int) -> PeerNode:
+        """Create a new peer node"""
+        node = PeerNode(node_id, port)
+        self.nodes[node_id] = node
+        return node
 
-        # Local data
-        self.local_models: Dict[str, str] = {}  # model_id -> file_path
-        self.local_midi_data: List[np.ndarray] = []
-        self.reputation_score = 5.0  # Start with neutral reputation
+    def create_coordinator_node(self, node_id: str) -> CoordinatorNode:
+        """Create a new coordinator node"""
+        coordinator = CoordinatorNode(node_id)
+        self.coordinators[node_id] = coordinator
+        return coordinator
 
-        # Network components
-        self.discovery_thread = None
-        self.server_thread = None
-        self.running = False
+    async def simulate_network_activity(self):
+        """Simulate network activity for demonstration"""
+        print("=== P2P Music Generation Network Simulation ===\n")
 
-        # DHT-like routing table for decentralization
-        self.routing_table: Dict[str, List[str]] = {}  # topic -> [peer_ids]
+        # Create nodes
+        peer1 = self.create_peer_node("peer_001", 8001)
+        peer2 = self.create_peer_node("peer_002", 8002)
+        coordinator = self.create_coordinator_node("coord_001")
 
-        logger.info(f"Initialized P2P Music Network - Peer ID: {self.peer_id[:8]}...")
+        # Start peer nodes
+        await peer1.start()
+        await peer2.start()
 
-    def start_multicast_listener(self):
-        """Listen for multicast announcements from other peers"""
+        # Simulate some delay for network discovery
+        await asyncio.sleep(2)
 
-        def listener():
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind(('', 9999))
+        # Simulate training orchestration
+        print("\n--- Starting Federated Training ---")
+        session_id = await coordinator.orchestrate_training(["peer_001", "peer_002"])
 
-                while self.running:
-                    try:
-                        data, addr = sock.recvfrom(1024)
-                        announce_data = json.loads(data.decode())
+        # Peers participate in training
+        peer1_result = await peer1.participate_in_training()
+        peer2_result = await peer2.participate_in_training()
 
-                        if (announce_data.get("type") == "peer_announce"
-                                and announce_data.get("peer_id") != self.peer_id):
-                            # Discovered a new peer via multicast
-                            peer_info = {
-                                "peer_id": announce_data["peer_id"],
-                                "username": announce_data["username"],
-                                "genres": [],
-                                "reputation": 5.0
-                            }
-
-                            self.add_peer(peer_info, announce_data["ip"], announce_data["port"])
-
-                    except socket.timeout:
-                        continue
-                    except Exception as e:
-                        logger.debug(f"Multicast listener error: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to start multicast listener: {e}")
-
-        # Start listener in background thread
-        listener_thread = threading.Thread(target=listener)
-        listener_thread.daemon = True
-        listener_thread.start()
-
-    def get_local_ip(self):
-        """Get local IP address"""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except:
-            return "127.0.0.1"
-
-    def start_network(self):
-        """Start the P2P network"""
-        self.running = True
-
-        # Start HTTP server for peer communication
-        self.server_thread = threading.Thread(target=self.start_http_server)
-        self.server_thread.daemon = True
-        self.server_thread.start()
-
-        # Start multicast listener - THIS WAS MISSING!
-        self.start_multicast_listener()
-
-        # Start peer discovery
-        self.discovery_thread = threading.Thread(target=self.peer_discovery_loop)
-        self.discovery_thread.daemon = True
-        self.discovery_thread.start()
-
-        logger.info(f"🎵 P2P Music Network started on {self.ip_address}:{self.port}")
-        logger.info(f"👤 Username: {self.username}")
-        logger.info(f"🆔 Peer ID: {self.peer_id[:8]}...")
-
-    def start_http_server(self):
-        """Start HTTP server for peer communication"""
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-
-        class P2PHandler(BaseHTTPRequestHandler):
-            def __init__(self, p2p_network, *args, **kwargs):
-                self.p2p_network = p2p_network
-                super().__init__(*args, **kwargs)
-
-            def do_GET(self):
-                if self.path == "/peer_info":
-                    self.send_peer_info()
-                elif self.path == "/peer_list":
-                    self.send_peer_list()
-                elif self.path.startswith("/models"):
-                    self.send_models_list()
-                elif self.path.startswith("/groups"):
-                    self.send_groups_list()
-                elif self.path.startswith("/download/"):
-                    self.handle_download()
-                else:
-                    self.send_error(404)
-
-            def do_POST(self):
-                if self.path == "/join_group":
-                    self.handle_join_group()
-                elif self.path == "/create_group":
-                    self.handle_create_group()
-                elif self.path == "/share_model":
-                    self.handle_share_model()
-                elif self.path == "/group_announce":
-                    self.handle_group_announce()
-                elif self.path == "/group_notification":
-                    self.handle_group_notification()
-                else:
-                    self.send_error(404)
-
-            def send_peer_info(self):
-                peer_info = {
-                    "peer_id": self.p2p_network.peer_id,
-                    "username": self.p2p_network.username,
-                    "genres": list(set([model.genre for model in self.p2p_network.models.values()])),
-                    "models_count": len(self.p2p_network.local_models),
-                    "groups": list(self.p2p_network.my_groups),
-                    "reputation": self.p2p_network.reputation_score
-                }
-
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(peer_info).encode())
-
-            def send_peer_list(self):
-                """Send list of known peers"""
-                peers_data = []
-                for peer in self.p2p_network.peers.values():
-                    peers_data.append({
-                        "peer_id": peer.peer_id,
-                        "username": peer.username,
-                        "ip_address": peer.ip_address,
-                        "port": peer.port,
-                        "genres": peer.genres,
-                        "reputation": peer.reputation_score
-                    })
-
-                response_data = {"peers": peers_data}
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(response_data).encode())
-
-            def send_models_list(self):
-                """Send list of available models"""
-                models_data = []
-                for model in self.p2p_network.models.values():
-                    models_data.append(asdict(model))
-
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(models_data).encode())
-
-            def send_groups_list(self):
-                """Send list of available groups"""
-                groups_data = []
-                for group in self.p2p_network.groups.values():
-                    if group.is_public:
-                        groups_data.append(asdict(group))
-
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(groups_data).encode())
-
-            def handle_group_announce(self):
-                """Handle group announcement from another peer"""
-                try:
-                    content_length = int(self.headers['Content-Length'])
-                    post_data = self.rfile.read(content_length)
-                    group_data = json.loads(post_data.decode('utf-8'))
-
-                    # Add the group to our known groups
-                    group = LearningGroup(
-                        group_id=group_data["group_id"],
-                        name=group_data["name"],
-                        genre=group_data["genre"],
-                        description=group_data["description"],
-                        admin=group_data["admin"],
-                        members=[group_data["admin"]],
-                        max_members=group_data["max_members"],
-                        is_public=group_data["is_public"],
-                        training_rounds=0,
-                        model_version="1.0.0",
-                        created_at=group_data["created_at"],
-                        last_active=group_data["timestamp"],
-                        entry_requirements={}
-                    )
-
-                    self.p2p_network.groups[group.group_id] = group
-
-                    self.send_response(200)
-                    self.end_headers()
-
-                except Exception as e:
-                    logger.error(f"Failed to handle group announcement: {e}")
-                    self.send_error(500)
-
-            def handle_group_notification(self):
-                """Handle group join notifications"""
-                try:
-                    content_length = int(self.headers['Content-Length'])
-                    post_data = self.rfile.read(content_length)
-                    notification = json.loads(post_data.decode('utf-8'))
-
-                    logger.info(f"👥 {notification['username']} joined group {notification['group_id'][:8]}...")
-
-                    self.send_response(200)
-                    self.end_headers()
-
-                except Exception as e:
-                    logger.error(f"Failed to handle group notification: {e}")
-                    self.send_error(500)
-
-            def handle_download(self):
-                """Handle model download requests"""
-                # Placeholder implementation
-                self.send_error(501, "Download not implemented yet")
-
-            def handle_join_group(self):
-                """Handle group join requests"""
-                # Placeholder implementation
-                self.send_error(501, "Join group not implemented yet")
-
-            def handle_create_group(self):
-                """Handle group creation requests"""
-                # Placeholder implementation
-                self.send_error(501, "Create group not implemented yet")
-
-            def handle_share_model(self):
-                """Handle model sharing requests"""
-                # Placeholder implementation
-                self.send_error(501, "Share model not implemented yet")
-
-        # Create server with closure to pass p2p_network
-        handler = lambda *args, **kwargs: P2PHandler(self, *args, **kwargs)
-
-        try:
-            server = HTTPServer(("", self.port), handler)
-            server.serve_forever()
-        except Exception as e:
-            logger.error(f"HTTP server error: {e}")
-
-    def peer_discovery_loop(self):
-        """Discover peers in the network"""
-        # Initial rapid discovery
-        for i in range(3):
-            try:
-                self.discover_peers()
-                time.sleep(2)  # Quick initial scans
-            except Exception as e:
-                logger.error(f"Initial peer discovery error: {e}")
-
-        # Then normal discovery loop
-        while self.running:
-            try:
-                self.discover_peers()
-                self.cleanup_inactive_peers()
-                time.sleep(15)  # Reduced from 30 seconds
-            except Exception as e:
-                logger.error(f"Peer discovery error: {e}")
-
-    def discover_peers(self):
-        """Discover peers using multicast and known peers"""
-        # Multicast discovery
-        self.multicast_announce()
-
-        # Scan local network
-        self.scan_local_network()
-
-        # Ask known peers for their peer lists
-        self.request_peer_lists()
-
-    def multicast_announce(self):
-        """Announce presence via multicast"""
-        try:
-            # Try both broadcast and multicast
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-            announce_data = {
-                "type": "peer_announce",
-                "peer_id": self.peer_id,
-                "username": self.username,
-                "ip": self.ip_address,
-                "port": self.port,
-                "timestamp": datetime.now().isoformat()
+        # Simulate model updates aggregation with training summaries
+        mock_updates = [
+            {
+                'node_id': 'peer_001',
+                'parameters': peer1.training_manager.get_model_weights().tolist(),
+                'data_size': peer1.music_library.get_song_count(),
+                'metrics': peer1_result['metrics'] if peer1_result else {'loss': 0.5},
+                'training_summary': peer1.music_library.get_training_summary()
+            },
+            {
+                'node_id': 'peer_002',
+                'parameters': peer2.training_manager.get_model_weights().tolist(),
+                'data_size': peer2.music_library.get_song_count(),
+                'metrics': peer2_result['metrics'] if peer2_result else {'loss': 0.4},
+                'training_summary': peer2.music_library.get_training_summary()
             }
+        ]
 
-            message = json.dumps(announce_data).encode()
+        result = coordinator.aggregate_model_updates(session_id, mock_updates)
+        print(f"Aggregation result: {result}")
 
-            # Broadcast
-            sock.sendto(message, ('255.255.255.255', 9999))
+        # Generate new songs
+        print("\n--- Generating New Music ---")
+        generated_songs = coordinator.generate_songs(3, {"genre": "electronic", "tempo": 128})
 
-            # Also try localhost for same-machine testing
-            sock.sendto(message, ('127.0.0.1', 9999))
+        # Distribute to peers
+        print("\n--- Distributing Generated Songs ---")
+        peer1.download_generated_songs(generated_songs)
+        peer2.download_generated_songs(generated_songs)
 
-            sock.close()
-            logger.debug(f"Sent multicast announcement")
+        # Print summary
+        print(f"\n=== Network Summary ===")
+        print(f"Peers: {len(self.nodes)}")
+        print(f"Coordinators: {len(self.coordinators)}")
+        print(f"Songs generated: {len(generated_songs)}")
 
-        except Exception as e:
-            logger.debug(f"Multicast announce failed: {e}")
+        # Show detailed peer statistics
+        for node_id, peer in self.nodes.items():
+            stats = peer.get_local_library_stats()
+            print(f"\n{node_id} Stats:")
+            print(f"  - Training songs: {stats.get('total_songs', 0)}")
+            print(f"  - Downloaded songs: {stats['downloaded_songs']}")
+            print(f"  - Songs saved locally: {stats['songs_stored']}")
+            print(f"  - Storage path: {stats['storage_path']}")
+            if stats.get('genres'):
+                print(f"  - Music genres: {', '.join(stats['genres'])}")
 
-    def scan_local_network(self):
-        """Scan local network for peers"""
-        base_ip = ".".join(self.ip_address.split(".")[:-1])
-
-        def check_peer(ip, port):
-            try:
-                # Try multiple common ports, not just self.port
-                for p in [8000, 8001, 8002, 8003, 8004, 8005]:
-                    try:
-                        response = requests.get(f"http://{ip}:{p}/peer_info", timeout=1)
-                        if response.status_code == 200:
-                            peer_data = response.json()
-                            self.add_peer(peer_data, ip, p)
-                            return
-                    except:
-                        continue
-            except:
-                pass
-
-        # Scan local network range
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            # Scan localhost first (for testing on same machine)
-            for port in range(8000, 8010):
-                if port != self.port:
-                    executor.submit(check_peer, "127.0.0.1", port)
-
-            # Then scan local network
-            if not self.ip_address.startswith("127."):
-                for i in range(1, 255):
-                    ip = f"{base_ip}.{i}"
-                    if ip != self.ip_address:
-                        executor.submit(check_peer, ip, None)
-
-    def add_peer(self, peer_data: dict, ip: str, port: int):
-        """Add a discovered peer"""
-        # Don't add ourselves
-        if peer_data["peer_id"] == self.peer_id:
-            return
-
-        peer_info = PeerInfo(
-            peer_id=peer_data["peer_id"],
-            username=peer_data["username"],
-            ip_address=ip,
-            port=port,
-            last_seen=datetime.now().isoformat(),
-            genres=peer_data.get("genres", []),
-            models_shared=peer_data.get("models", []),
-            groups_joined=peer_data.get("groups", []),
-            reputation_score=peer_data.get("reputation", 5.0),
-            upload_count=0,
-            download_count=0
+        # Save final model state
+        final_model_path = coordinator.local_storage.save_model(
+            coordinator.global_model.weights,
+            len(coordinator.active_sessions)
         )
+        print(f"\nFinal trained model saved: {final_model_path}")
 
-        if peer_info.peer_id not in self.peers:
-            self.peers[peer_info.peer_id] = peer_info
-            logger.info(f"📡 NEW PEER: {peer_info.username} @ {ip}:{port} ({peer_info.peer_id[:8]}...)")
-        else:
-            # Update existing peer
-            self.peers[peer_info.peer_id] = peer_info
-            logger.debug(f"📡 Updated peer: {peer_info.username}")
+        print(f"\n🎵 Generated songs are saved in each peer's local directory!")
+        print(f"   Check the 'p2p_music_node_*' folders for saved songs.")
 
-    def create_learning_group(self, name: str, genre: str, description: str,
-                              max_members: int = 10, is_public: bool = True,
-                              entry_requirements: Dict = None) -> str:
-        """Create a new learning group"""
-        group_id = str(uuid.uuid4())
 
-        group = LearningGroup(
-            group_id=group_id,
-            name=name,
-            genre=genre,
-            description=description,
-            admin=self.peer_id,
-            members=[self.peer_id],
-            max_members=max_members,
-            is_public=is_public,
-            training_rounds=0,
-            model_version="1.0.0",
-            created_at=datetime.now().isoformat(),
-            last_active=datetime.now().isoformat(),
-            entry_requirements=entry_requirements or {}
-        )
-
-        self.groups[group_id] = group
-        self.my_groups.add(group_id)
-
-        # Announce group to network
-        self.announce_group(group)
-
-        logger.info(f"🎯 Created learning group: {name} ({genre})")
-        return group_id
-
-    def join_learning_group(self, group_id: str) -> bool:
-        """Join an existing learning group"""
-        if group_id not in self.groups:
-            logger.error(f"Group {group_id} not found")
-            return False
-
-        group = self.groups[group_id]
-
-        # Check if group is full
-        if len(group.members) >= group.max_members:
-            logger.error(f"Group {group.name} is full")
-            return False
-
-        # Check entry requirements
-        if not self.meets_requirements(group.entry_requirements):
-            logger.error(f"Don't meet requirements for group {group.name}")
-            return False
-
-        # Join group
-        group.members.append(self.peer_id)
-        group.last_active = datetime.now().isoformat()
-        self.my_groups.add(group_id)
-
-        # Notify group admin
-        self.notify_group_join(group_id)
-
-        logger.info(f"🎵 Joined learning group: {group.name}")
-        return True
-
-    def leave_learning_group(self, group_id: str):
-        """Leave a learning group"""
-        if group_id in self.groups:
-            group = self.groups[group_id]
-            if self.peer_id in group.members:
-                group.members.remove(self.peer_id)
-                self.my_groups.discard(group_id)
-                logger.info(f"👋 Left learning group: {group.name}")
-
-    def switch_learning_group(self, from_group_id: str, to_group_id: str) -> bool:
-        """Switch from one learning group to another"""
-        if self.join_learning_group(to_group_id):
-            self.leave_learning_group(from_group_id)
-            logger.info(f"🔄 Switched from group {from_group_id[:8]}... to {to_group_id[:8]}...")
-            return True
-        return False
-
-    def discover_learning_groups(self, genre_filter: str = None) -> List[LearningGroup]:
-        """Discover available learning groups"""
-        discovered_groups = []
-
-        # Ask all known peers for their groups
-        for peer in self.peers.values():
-            try:
-                response = requests.get(f"http://{peer.ip_address}:{peer.port}/groups", timeout=5)
-                if response.status_code == 200:
-                    groups_data = response.json()
-                    for group_data in groups_data:
-                        group = LearningGroup(**group_data)
-                        if genre_filter is None or group.genre.lower() == genre_filter.lower():
-                            discovered_groups.append(group)
-                            self.groups[group.group_id] = group
-            except Exception as e:
-                logger.debug(f"Failed to get groups from {peer.username}: {e}")
-
-        return discovered_groups
-
-    def start_federated_training(self, group_id: str, rounds: int = 10):
-        """Start federated training for a group"""
-        if group_id not in self.my_groups:
-            logger.error(f"Not a member of group {group_id}")
-            return
-
-        group = self.groups[group_id]
-
-        if group.admin == self.peer_id:
-            # I'm the admin, start as server
-            self.start_group_training_server(group_id, rounds)
-        else:
-            # Join as client
-            self.start_group_training_client(group_id)
-
-    def search_models(self, query: str = "", genre: str = "", min_quality: float = 0.0) -> List[MusicModel]:
-        """Search for music models across the network"""
-        results = []
-
-        # Search local models
-        for model in self.models.values():
-            if self.matches_search(model, query, genre, min_quality):
-                results.append(model)
-
-        # Search peer models
-        for peer in self.peers.values():
-            try:
-                response = requests.get(f"http://{peer.ip_address}:{peer.port}/models", timeout=5)
-                if response.status_code == 200:
-                    models_data = response.json()
-                    for model_data in models_data:
-                        model = MusicModel(**model_data)
-                        if self.matches_search(model, query, genre, min_quality):
-                            results.append(model)
-            except Exception as e:
-                logger.debug(f"Failed to search models from {peer.username}: {e}")
-
-        # Sort by quality and popularity
-        results.sort(key=lambda m: (m.quality_score, m.download_count), reverse=True)
-        return results
-
-    def matches_search(self, model: MusicModel, query: str, genre: str, min_quality: float) -> bool:
-        """Check if model matches search criteria"""
-        if min_quality > 0 and model.quality_score < min_quality:
-            return False
-
-        if genre and model.genre.lower() != genre.lower():
-            return False
-
-        if query:
-            search_text = f"{model.name} {model.description} {' '.join(model.tags)}".lower()
-            if query.lower() not in search_text:
-                return False
-
-        return True
-
-    def download_model(self, model_id: str, save_path: str = None) -> bool:
-        """Download a model from the network"""
-        # Find which peer has the model
-        model_peer = None
-        for peer in self.peers.values():
-            if model_id in peer.models_shared:
-                model_peer = peer
-                break
-
-        if not model_peer:
-            logger.error(f"Model {model_id} not found in network")
-            return False
-
-        try:
-            # Download model
-            download_url = f"http://{model_peer.ip_address}:{model_peer.port}/download/{model_id}"
-            response = requests.get(download_url, stream=True, timeout=30)
-
-            if response.status_code == 200:
-                if save_path is None:
-                    save_path = f"downloaded_model_{model_id[:8]}.zip"
-
-                with open(save_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-
-                # Update download count
-                if model_id in self.models:
-                    self.models[model_id].download_count += 1
-
-                logger.info(f"📥 Downloaded model {model_id[:8]}... to {save_path}")
-                return True
-            else:
-                logger.error(f"Failed to download model: HTTP {response.status_code}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Download failed: {e}")
-            return False
-
-    def generate_song_from_model(self, model_id: str, length: int = 200,
-                                 temperature: float = 0.8, output_file: str = None) -> str:
-        """Generate a song using a specific model"""
-        if model_id not in self.local_models:
-            logger.error(f"Model {model_id} not available locally. Download it first.")
-            return None
-
-        try:
-            # Load the model
-            model_path = self.local_models[model_id]
-            generator = self.load_model_from_file(model_path)
-
-            # Generate music
-            generated_music = generator.generate_music(length=length, temperature=temperature)
-
-            # Save as MIDI
-            if output_file is None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_file = f"generated_song_{model_id[:8]}_{timestamp}.mid"
-
-            generator.piano_roll_to_midi(generated_music, output_file)
-
-            logger.info(f"🎵 Generated song: {output_file}")
-            return output_file
-
-        except Exception as e:
-            logger.error(f"Song generation failed: {e}")
-            return None
-
-    def get_network_stats(self) -> Dict:
-        """Get network statistics"""
-        return {
-            "total_peers": len(self.peers),
-            "total_models": len(self.models),
-            "total_groups": len(self.groups),
-            "my_groups": len(self.my_groups),
-            "my_models": len(self.local_models),
-            "reputation": self.reputation_score,
-            "genres_available": list(set([model.genre for model in self.models.values()])),
-            "top_models": sorted(self.models.values(), key=lambda m: m.quality_score, reverse=True)[:5]
-        }
-
-    def display_network_browser(self):
-        """Display network browser interface"""
-        print("\n" + "=" * 80)
-        print("🎵 NAPSTER_ML - P2P MUSIC AI NETWORK BROWSER")
-        print("=" * 80)
-
-        stats = self.get_network_stats()
-
-        print(f"👥 Connected Peers: {stats['total_peers']}")
-        print(f"🤖 Available Models: {stats['total_models']}")
-        print(f"🎯 Learning Groups: {stats['total_groups']}")
-        print(f"⭐ Your Reputation: {stats['reputation']:.1f}")
-
-        print(f"\n🎼 Available Genres: {', '.join(stats['genres_available'])}")
-
-        print(f"\n🏆 Top Models:")
-        for i, model in enumerate(stats['top_models'], 1):
-            print(f"  {i}. {model.name} ({model.genre}) - Quality: {model.quality_score:.1f}")
-
-        print(f"\n🎯 Your Groups:")
-        for group_id in self.my_groups:
-            if group_id in self.groups:
-                group = self.groups[group_id]
-                print(f"  • {group.name} ({group.genre}) - {len(group.members)} members")
-
-    def cleanup_inactive_peers(self):
-        """Remove inactive peers"""
-        current_time = datetime.now()
-        inactive_peers = []
-
-        for peer_id, peer in self.peers.items():
-            last_seen = datetime.fromisoformat(peer.last_seen)
-            if current_time - last_seen > timedelta(minutes=10):
-                inactive_peers.append(peer_id)
-
-        for peer_id in inactive_peers:
-            del self.peers[peer_id]
-            logger.debug(f"Removed inactive peer: {peer_id[:8]}...")
-
-    def shutdown(self):
-        """Shutdown the network"""
-        self.running = False
-        logger.info("🛑 Shutting down NapsterML - P2P Music Network")
-
-    def announce_group(self, group: LearningGroup):
-        """Announce a new group to the network"""
-        try:
-            group_announcement = {
-                "type": "group_announce",
-                "group_id": group.group_id,
-                "name": group.name,
-                "genre": group.genre,
-                "description": group.description,
-                "admin": group.admin,
-                "max_members": group.max_members,
-                "is_public": group.is_public,
-                "created_at": group.created_at,
-                "peer_id": self.peer_id,
-                "timestamp": datetime.now().isoformat()
-            }
-
-            # Announce to all known peers
-            for peer in self.peers.values():
-                try:
-                    requests.post(
-                        f"http://{peer.ip_address}:{peer.port}/group_announce",
-                        json=group_announcement,
-                        timeout=5
-                    )
-                except Exception as e:
-                    logger.debug(f"Failed to announce group to {peer.username}: {e}")
-
-        except Exception as e:
-            logger.error(f"Group announcement failed: {e}")
-
-    def request_peer_lists(self):
-        """Request peer lists from known peers to discover more peers"""
-        for peer in list(self.peers.values()):
-            try:
-                response = requests.get(
-                    f"http://{peer.ip_address}:{peer.port}/peer_list",
-                    timeout=5
-                )
-                if response.status_code == 200:
-                    peer_list = response.json()
-                    for peer_data in peer_list.get("peers", []):
-                        # Add new peers we don't know about
-                        if peer_data["peer_id"] not in self.peers and peer_data["peer_id"] != self.peer_id:
-                            self.add_peer(peer_data, peer_data["ip_address"], peer_data["port"])
-            except Exception as e:
-                logger.debug(f"Failed to get peer list from {peer.username}: {e}")
-
-    def meets_requirements(self, requirements: Dict) -> bool:
-        """Check if this peer meets the group entry requirements"""
-        # Simple implementation - can be extended
-        if not requirements:
-            return True
-
-        # Check minimum reputation if required
-        min_reputation = requirements.get("min_reputation", 0)
-        if self.reputation_score < min_reputation:
-            return False
-
-        # Check required genres if specified
-        required_genres = requirements.get("required_genres", [])
-        if required_genres:
-            my_genres = list(set([model.genre for model in self.models.values()]))
-            if not any(genre in my_genres for genre in required_genres):
-                return False
-
-        return True
-
-    def notify_group_join(self, group_id: str):
-        """Notify group admin about a new member joining"""
-        if group_id not in self.groups:
-            return
-
-        group = self.groups[group_id]
-        admin_peer = self.peers.get(group.admin)
-
-        if admin_peer:
-            try:
-                notification = {
-                    "type": "group_join",
-                    "group_id": group_id,
-                    "new_member": self.peer_id,
-                    "username": self.username,
-                    "timestamp": datetime.now().isoformat()
-                }
-
-                requests.post(
-                    f"http://{admin_peer.ip_address}:{admin_peer.port}/group_notification",
-                    json=notification,
-                    timeout=5
-                )
-            except Exception as e:
-                logger.debug(f"Failed to notify group admin: {e}")
-
-    def start_group_training_server(self, group_id: str, rounds: int):
-        """Start federated learning server"""
-        logger.info(f"🚀 Starting FL server for group {group_id}")
-        strategy = FedAvg(min_fit_clients=2, min_evaluate_clients=2, min_available_clients=2)
-        start_server(server_address=f"0.0.0.0:{self.port + 1000}", config=fl.server.ServerConfig(num_rounds=rounds), strategy=strategy)
-
-    def start_group_training_client(self, group_id: str):
-        """Join federated learning as client"""
-        logger.info(f"🤝 Joining FL training for group {group_id}")
-
-        # Create simple training data (in real app, use actual MIDI data)
-        X_train = np.random.random((100, 64, 16))
-        y_train = np.random.random((100, 64, 16))
-        X_val = np.random.random((20, 64, 16))
-        y_val = np.random.random((20, 64, 16))
-
-        # Create model
-        model = SimpleMIDIGenerator().build_model()
-
-        # Find group admin's server address
-        group = self.groups[group_id]
-        admin_peer = self.peers.get(group.admin)
-        if admin_peer:
-            server_address = f"{admin_peer.ip_address}:{admin_peer.port + 1000}"
-            client = MusicFLClient(model, (X_train, y_train), (X_val, y_val))
-            fl.client.start_numpy_client(server_address=server_address, client=client)
-
-    def load_model_from_file(self, model_path: str):
-        """Load a model from file"""
-        # Simple implementation - returns a basic generator
-        generator = SimpleMIDIGenerator()
-        generator.build_model()
-        return generator
-
-
-# Simplified MIDI generator for the prototype
-class SimpleMIDIGenerator:
-    def __init__(self, sequence_length=64, fs=16):
-        self.sequence_length = sequence_length
-        self.fs = fs
-        self.model = None
-
-    def build_model(self):
-        """Build a simple LSTM model"""
-        self.model = Sequential([
-            LSTM(128, return_sequences=True, input_shape=(self.sequence_length, 16)),
-            Dropout(0.3),
-            LSTM(128, return_sequences=True),
-            Dropout(0.3),
-            Dense(16, activation='sigmoid')
-        ])
-
-        self.model.compile(optimizer=Adam(0.001), loss='mse')
-        return self.model
-
-    def generate_music(self, length=200, temperature=0.8):
-        """Generate music (simplified for prototype)"""
-        if self.model is None:
-            self.build_model()
-
-        # Generate random music for prototype
-        return np.random.random((length, 16))
-
-    def piano_roll_to_midi(self, piano_roll, filename):
-        """Convert to MIDI (simplified)"""
-        # Create a simple MIDI file for prototype
-        pm = pretty_midi.PrettyMIDI()
-        instrument = pretty_midi.Instrument(program=0)
-
-        for i, frame in enumerate(piano_roll[:100]):  # Limit for prototype
-            if frame[0] > 0.3:  # Simple threshold
-                note = pretty_midi.Note(
-                    velocity=int(frame[1] * 127),
-                    pitch=int(frame[0] * 88) + 20,
-                    start=i * 0.25,
-                    end=(i + 1) * 0.25
-                )
-                instrument.notes.append(note)
-
-        pm.instruments.append(instrument)
-        pm.write(filename)
-        return filename
-
-class MusicFLClient(NumPyClient):
-    def __init__(self, model, train_data, val_data):
-        self.model = model
-        self.train_data = train_data
-        self.val_data = val_data
-
-    def get_parameters(self, config):
-        return self.model.get_weights()
-
-    def fit(self, parameters, config):
-        self.model.set_weights(parameters)
-        self.model.fit(self.train_data[0], self.train_data[1], epochs=1, batch_size=32, verbose=0)
-        return self.model.get_weights(), len(self.train_data[0]), {}
-
-    def evaluate(self, parameters, config):
-        self.model.set_weights(parameters)
-        loss, accuracy = self.model.evaluate(self.val_data[0], self.val_data[1], verbose=0)
-        return loss, len(self.val_data[0]), {"accuracy": accuracy}
-
-
-def main():
-    """Main function"""
-    parser = argparse.ArgumentParser(description="Napster ML - P2P Music AI Network. Napster for Song ML Models")
-    parser.add_argument("--username", type=str, required=True, help="Your username")
-    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
-    parser.add_argument("--mode", choices=["interactive", "daemon"], default="interactive")
-
-    args = parser.parse_args()
-
-    # Initialize network
-    network = P2PMusicNetwork(args.username, args.port)
-    network.start_network()
-
-    if args.mode == "interactive":
-        # Interactive mode
-        print(f"\n🎵 Welcome to NapsterML - the P2P Music AI Network!")
-        print(f"Username: {args.username}")
-        print(f"Peer ID: {network.peer_id[:8]}...")
-
-        while True:
-            try:
-                print("📋 MENU:")
-                print("1. Browse Network")
-                print("2. Search Models")
-                print("3. Create Learning Group")
-                print("4. Join Learning Group")
-                print("5. Discover Groups")
-                print("6. Generate Song")
-                print("7. Start Federated Training")  # NEW
-                print("8. Network Stats")
-                print("9. Exit")
-
-                choice = input("\nEnter choice (1-8): ").strip()
-
-                if choice == "1":
-                    network.display_network_browser()
-
-                elif choice == "2":
-                    query = input("Search query (or Enter for all): ").strip()
-                    genre = input("Genre filter (or Enter for all): ").strip()
-
-                    models = network.search_models(query, genre)
-                    print(f"\n🔍 Found {len(models)} models:")
-                    for i, model in enumerate(models[:10], 1):
-                        print(f"  {i}. {model.name} ({model.genre}) - Quality: {model.quality_score:.1f}")
-                        print(f"     📝 {model.description}")
-                        print(f"     👤 By: {model.creator}")
-                        print(f"     📥 Downloads: {model.download_count}")
-
-                elif choice == "3":
-                    name = input("Group name: ").strip()
-                    genre = input("Genre: ").strip()
-                    description = input("Description: ").strip()
-                    max_members = int(input("Max members (default 10): ") or "10")
-
-                    group_id = network.create_learning_group(name, genre, description, max_members)
-                    print(f"✅ Created group: {name} (ID: {group_id[:8]}...)")
-
-                elif choice == "4":
-                    groups = network.discover_learning_groups()
-                    if groups:
-                        print("\n🎯 Available Groups:")
-                        for i, group in enumerate(groups, 1):
-                            print(
-                                f"  {i}. {group.name} ({group.genre}) - {len(group.members)}/{group.max_members} members")
-                            print(f"     📝 {group.description}")
-
-                        try:
-                            selection = int(input("Select group number (0 to cancel): "))
-                            if 1 <= selection <= len(groups):
-                                selected_group = groups[selection - 1]
-                                if network.join_learning_group(selected_group.group_id):
-                                    print(f"✅ Joined group: {selected_group.name}")
-                                else:
-                                    print("❌ Failed to join group")
-                        except ValueError:
-                            print("Invalid selection")
-                    else:
-                        print("No groups found")
-
-                elif choice == "5":
-                    genre_filter = input("Genre filter (or Enter for all): ").strip()
-                    groups = network.discover_learning_groups(genre_filter if genre_filter else None)
-                    print(f"\n🔍 Discovered {len(groups)} groups:")
-                    for group in groups:
-                        print(f"  • {group.name} ({group.genre}) - {len(group.members)} members")
-                        print(f"    📝 {group.description}")
-                        print(f"    👤 Admin: {group.admin[:8]}...")
-
-                elif choice == "6":
-                    # For prototype, create a simple generated song
-                    generator = SimpleMIDIGenerator()
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"p2p_generated_song_{timestamp}.mid"
-
-                    print("🎵 Generating song...")
-                    music = generator.generate_music(length=100)
-                    generator.piano_roll_to_midi(music, filename)
-                    print(f"✅ Generated: {filename}")
-
-                elif choice == "7":
-                    if network.my_groups:
-                        print("\n🎯 Your Groups:")
-                        groups_list = list(network.my_groups)
-                        for i, group_id in enumerate(groups_list, 1):
-                            group = network.groups[group_id]
-                            print(f"  {i}. {group.name} ({group.genre}) - {len(group.members)} members")
-
-                        try:
-                            selection = int(input("Select group for training (0 to cancel): "))
-                            if 1 <= selection <= len(groups_list):
-                                selected_group_id = groups_list[selection - 1]
-                                rounds = int(input("Training rounds (default 5): ") or "5")
-                                print(f"🚀 Starting federated training...")
-                                network.start_federated_training(selected_group_id, rounds)
-                            else:
-                                print("Cancelled")
-                        except ValueError:
-                            print("Invalid selection")
-                    else:
-                        print("❌ You need to join a group first!")
-
-                elif choice == "8":
-                    network.display_network_browser()
-
-                elif choice == "9":
-                    break
-
-                else:
-                    print("Invalid choice")
-
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                logger.error(f"Error: {e}")
-
-        network.shutdown()
-
-    else:
-        # Daemon mode
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            network.shutdown()
+# Example usage and demonstration
+async def main():
+    """Main function to demonstrate the P2P music generation network"""
+    network = P2PMusicNetwork()
+    await network.simulate_network_activity()
 
 
 if __name__ == "__main__":
-    main()
-
-# Example usage scenarios:
-"""
-# Start different nodes:
-
-# Music Producer Node
-python p2p_music_napster.py --username "StudioA_Producer" --port 8000
-
-# Electronic Music Enthusiast
-python p2p_music_napster.py --username "EDM_Lover" --port 8001
-
-# Classical Music Collector
-python p2p_music_napster.py --username "ClassicalMaestro" --port 8002
-
-# Jazz Musician
-python p2p_music_napster.py --username "JazzCat" --port 8003
-
-# Example distributed network:
-# Node 1: Creates "Epic Orchestral" learning group
-# Node 2: Joins group and contributes classical MIDI files
-# Node 3: Searches for "epic" models and downloads favorites
-# Node 4: Creates competing "Jazz Fusion" group
-# Node 2: Switches from orchestral to jazz group
-# All nodes: Collaborate on training, share models, generate songs
-"""
+    asyncio.run(main())
